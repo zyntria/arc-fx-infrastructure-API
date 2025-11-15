@@ -1,0 +1,311 @@
+/**
+ * NFT Image Storage Service with Storacha (Web3.Storage) Integration
+ * Uses dynamic imports to handle ESM/CJS compatibility
+ */
+
+import crypto from "crypto"
+import fetch from "node-fetch"
+
+// Polyfill fetch for Storacha HTTP transport
+if (typeof globalThis.fetch === 'undefined') {
+  // @ts-ignore
+  globalThis.fetch = fetch
+}
+
+/**
+ * Storage result
+ */
+export interface StorageResult {
+  cid: string
+  ipfs_url: string
+  gateway_url: string
+  storage_type: "ipfs" | "mock"
+}
+
+let storachaClient: any = null
+let clientInitialized = false
+
+/**
+ * Get Storacha client instance (singleton with lazy loading)
+ */
+async function getStorachaClient(): Promise<any | null> {
+  // Return cached client if available
+  if (storachaClient) {
+    return storachaClient
+  }
+
+  // Return null if already tried and failed
+  if (clientInitialized && !storachaClient) {
+    return null
+  }
+
+  const privateKey = process.env.STORACHA_PRIVATE_KEY
+  const proof = process.env.STORACHA_PROOF
+
+  if (!privateKey || !proof) {
+    console.warn(
+      "[Storage] STORACHA_PRIVATE_KEY and STORACHA_PROOF not configured, using mock storage"
+    )
+    clientInitialized = true
+    return null
+  }
+
+  try {
+    // Use dynamic imports to avoid CommonJS/ESM issues
+    const { create } = await import("@web3-storage/w3up-client")
+    const { StoreMemory } = await import("@web3-storage/w3up-client/stores/memory")
+    const Signer = await import("@web3-storage/w3up-client/principal/ed25519")
+    const { CarReader } = await import("@ipld/car")
+    const Delegation = await import("@ucanto/core/delegation")
+
+    console.log("[Storage] Initializing Storacha client...")
+
+    // Parse the private key to get the principal (DID)
+    const principal = Signer.parse(privateKey)
+    
+    // Create client with memory store
+    const client = await create({ principal, store: new StoreMemory() })
+
+    // Decode the proof from base64
+    const proofData = Buffer.from(proof, "base64")
+    
+    // Parse the CAR file to extract blocks
+    const reader = await CarReader.fromBytes(proofData)
+    const blocks = []
+    for await (const block of reader.blocks()) {
+      blocks.push(block)
+    }
+    
+    // Import the delegation from blocks
+    const delegation = Delegation.importDAG(blocks)
+    
+    // Add space and set it as current
+    const space = await client.addSpace(delegation)
+    await client.setCurrentSpace(space.did())
+
+    console.log(`[Storage] ✅ Storacha client initialized with Space: ${space.did()}`)
+    
+    // Cache the client
+    storachaClient = client
+    clientInitialized = true
+    return client
+  } catch (error: any) {
+    console.error("[Storage] ❌ Failed to initialize Storacha client:", error.message)
+    if (error.stack) {
+      console.error("[Storage] Stack trace:", error.stack.split('\n').slice(0, 5).join('\n'))
+    }
+    clientInitialized = true
+    return null
+  }
+}
+
+/**
+ * Upload image to IPFS using Storacha
+ */
+export async function uploadImageToIPFS(params: {
+  bondId?: string
+  buffer: Buffer
+  filename?: string
+  contentType?: string
+}): Promise<StorageResult> {
+  const { bondId, buffer, filename, contentType = "image/png" } = params
+
+  const client = await getStorachaClient()
+
+  // Use mock if Storacha not configured
+  if (!client) {
+    return uploadImageMock(params)
+  }
+
+  try {
+    const name = filename || `${bondId || "nft"}-certificate.png`
+
+    // Create a File object for Storacha
+    const file = new File([buffer], name, { type: contentType })
+
+    // Upload to IPFS via Storacha
+    console.log(`[Storage] Uploading ${name} to IPFS via Storacha...`)
+    const cid = await client.uploadFile(file)
+    console.log(`[Storage] ✅ Uploaded to IPFS: ${cid}`)
+
+    const ipfsUrl = `ipfs://${cid}`
+    const gatewayUrl = `https://w3s.link/ipfs/${cid}`
+
+    return {
+      cid: cid.toString(),
+      ipfs_url: ipfsUrl,
+      gateway_url: gatewayUrl,
+      storage_type: "ipfs",
+    }
+  } catch (error: any) {
+    console.error("[Storage] ❌ IPFS upload failed:", error.message)
+    // Fallback to mock
+    return uploadImageMock(params)
+  }
+}
+
+/**
+ * Upload metadata JSON to IPFS
+ */
+export async function uploadMetadataToIPFS(params: {
+  metadata: object
+  filename?: string
+}): Promise<StorageResult> {
+  const { metadata, filename = "metadata.json" } = params
+
+  const client = await getStorachaClient()
+
+  if (!client) {
+    return uploadMetadataMock(params)
+  }
+
+  try {
+    // Convert metadata to JSON string
+    const jsonString = JSON.stringify(metadata, null, 2)
+
+    // Create File for JSON
+    const file = new File([jsonString], filename, { type: "application/json" })
+
+    console.log(`[Storage] Uploading ${filename} to IPFS...`)
+    const cid = await client.uploadFile(file)
+    console.log(`[Storage] ✅ Metadata uploaded: ${cid}`)
+
+    const ipfsUrl = `ipfs://${cid}`
+    const gatewayUrl = `https://w3s.link/ipfs/${cid}`
+
+    return {
+      cid: cid.toString(),
+      ipfs_url: ipfsUrl,
+      gateway_url: gatewayUrl,
+      storage_type: "ipfs",
+    }
+  } catch (error: any) {
+    console.error("[Storage] ❌ Metadata upload failed:", error.message)
+    return uploadMetadataMock(params)
+  }
+}
+
+/**
+ * Mock image upload (when Storacha not configured)
+ */
+function uploadImageMock(params: {
+  bondId?: string
+  buffer: Buffer
+}): StorageResult {
+  const hash = crypto.createHash("sha256").update(params.buffer).digest("hex")
+  const mockCid = `bafybei${hash.slice(0, 52)}`
+
+  console.log(`[Storage] 🔄 Using mock storage (Storacha not available): ${mockCid}`)
+
+  return {
+    cid: mockCid,
+    ipfs_url: `ipfs://${mockCid}`,
+    gateway_url: `https://w3s.link/ipfs/${mockCid}`,
+    storage_type: "mock",
+  }
+}
+
+/**
+ * Mock metadata upload
+ */
+function uploadMetadataMock(params: { metadata: object }): StorageResult {
+  const jsonString = JSON.stringify(params.metadata)
+  const hash = crypto.createHash("sha256").update(jsonString).digest("hex")
+  const mockCid = `bafybei${hash.slice(0, 52)}`
+
+  console.log(`[Storage] 🔄 Using mock metadata storage (Storacha not available): ${mockCid}`)
+
+  return {
+    cid: mockCid,
+    ipfs_url: `ipfs://${mockCid}`,
+    gateway_url: `https://w3s.link/ipfs/${mockCid}`,
+    storage_type: "mock",
+  }
+}
+
+/**
+ * Generate thumbnail from buffer
+ * (In production, use sharp to resize)
+ */
+export async function generateThumbnail(params: {
+  bondId?: string
+  buffer: Buffer
+}): Promise<string> {
+  const result = await uploadImageToIPFS({
+    bondId: params.bondId,
+    buffer: params.buffer,
+    filename: `${params.bondId || "nft"}-thumb.png`,
+  })
+
+  return result.gateway_url
+}
+
+/**
+ * Get public gateway URL for IPFS CID
+ */
+export function getIPFSGatewayURL(
+  cid: string,
+  gateway: "w3s" | "ipfs.io" | "dweb" = "w3s"
+): string {
+  // Remove ipfs:// prefix if present
+  if (cid.startsWith("ipfs://")) {
+    cid = cid.replace("ipfs://", "")
+  }
+
+  switch (gateway) {
+    case "w3s":
+      return `https://w3s.link/ipfs/${cid}`
+    case "ipfs.io":
+      return `https://ipfs.io/ipfs/${cid}`
+    case "dweb":
+      return `https://dweb.link/ipfs/${cid}`
+    default:
+      return `https://w3s.link/ipfs/${cid}`
+  }
+}
+
+/**
+ * Check if IPFS storage is configured
+ */
+export function isIPFSConfigured(): boolean {
+  return !!(
+    process.env.STORACHA_PRIVATE_KEY && process.env.STORACHA_PROOF
+  )
+}
+
+/**
+ * Get storage configuration status
+ */
+export async function getStorageStatus(): Promise<{
+  configured: boolean
+  provider: string
+  message: string
+  space_did?: string
+  working: boolean
+}> {
+  const privateKey = process.env.STORACHA_PRIVATE_KEY
+  const proof = process.env.STORACHA_PROOF
+
+  if (privateKey && proof) {
+    // Try to initialize client to check if it's working
+    const client = await getStorachaClient()
+    
+    return {
+      configured: true,
+      provider: "Storacha (Web3.Storage)",
+      message: client 
+        ? "IPFS storage is configured and ready" 
+        : "IPFS storage is configured but initialization failed. Using mock storage.",
+      space_did: "did:key:z6MkiQGSTCU1Ctm8AEqfv32U8E7dUspwe48ncSyBJaa6i19E",
+      working: !!client,
+    }
+  }
+
+  return {
+    configured: false,
+    provider: "Mock",
+    message:
+      "Using mock storage. Set STORACHA_PRIVATE_KEY and STORACHA_PROOF to enable IPFS.",
+    working: false,
+  }
+}
